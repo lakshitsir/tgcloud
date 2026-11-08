@@ -11,26 +11,36 @@ from starlette.requests import Request
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+def _safe_int(val: Any) -> int:
+    try:
+        return int(str(val).strip())
+    except Exception:
+        return 0
+
 CFG = {
-    "api_id": int(os.environ.get("TG_API_ID", "0")),
-    "api_hash": os.environ.get("TG_API_HASH", ""),
-    "session_string": os.environ.get("TG_SESSION_STRING", ""),
-    "api_key": os.environ.get("TG_API_KEY", "")
+    "api_id": _safe_int(os.environ.get("TG_API_ID", "0")),
+    "api_hash": os.environ.get("TG_API_HASH", "").strip(),
+    "session_string": os.environ.get("TG_SESSION_STRING", "").strip(),
+    "api_key": os.environ.get("TG_API_KEY", "").strip()
 }
 
 _client: Optional[TelegramClient] = None
 _loop = None
 
-async def get_tg() -> TelegramClient:
+async def get_tg(custom_cfg: Optional[Dict[str, Any]] = None) -> TelegramClient:
     """Stateless, multi-bot safe MTProto connection (receive_updates=False prevents session lock)."""
     global _client, _loop
+    c = custom_cfg or CFG
+    if not c.get("api_id") or not c.get("session_string"):
+        raise RuntimeError("Missing TG_API_ID, TG_API_HASH, or TG_SESSION_STRING in Vercel Environment Variables")
+
     cur_loop = asyncio.get_running_loop()
     if _client is None or _loop != cur_loop:
         _loop = cur_loop
         _client = TelegramClient(
-            StringSession(CFG["session_string"]),
-            CFG["api_id"],
-            CFG["api_hash"],
+            StringSession(c["session_string"]),
+            int(c["api_id"]),
+            c["api_hash"],
             receive_updates=False,
             request_retries=5,
             connection_retries=5,
@@ -69,11 +79,27 @@ def format_meta(msg) -> Dict[str, Any]:
     }
 
 # =========================================================
-# 1. CACHED 180-BYTE TICKET & SDK ENDPOINTS (0 VERCEL LOAD)
+# HANDLERS (0 BYTES VERCEL STORAGE / 0 BYTES FILE BANDWIDTH)
 # =========================================================
-async def get_ticket(request: Request):
+async def handle_health(request: Request):
+    env_ready = bool(CFG["api_id"] and CFG["api_hash"] and CFG["session_string"])
+    return compact_json({
+        "ok": 1,
+        "engine": "TG-Cloud V10 Final (Zero-Vercel-Load)",
+        "env_configured": env_ready,
+        "vercel_storage_used": "0 Bytes",
+        "vercel_file_bandwidth": "0 Bytes (Direct Client <-> Telegram MTProto)",
+        "routes": ["/", "/health", "/api/ticket", "/files", "/kv/{key}", "/delete/{id}", "/sdk/tgcloud.py"]
+    })
+
+async def handle_ticket(request: Request):
     if not check_auth(request):
-        return compact_json({"ok": 0, "err": "auth"}, 401)
+        return compact_json({"ok": 0, "err": "Unauthorized API Key"}, 401)
+    if not CFG["api_id"] or not CFG["session_string"]:
+        return compact_json({
+            "ok": 0,
+            "err": "Set TG_API_ID, TG_API_HASH, and TG_SESSION_STRING in Vercel Project Settings -> Environment Variables, then Redeploy."
+        }, 400)
     return compact_json({
         "ok": 1,
         "id": CFG["api_id"],
@@ -81,85 +107,104 @@ async def get_ticket(request: Request):
         "s": CFG["session_string"]
     }, cache_sec=86400)
 
-async def serve_sdk(request: Request):
-    sdk_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tgcloud.py")
-    if os.path.exists(sdk_path):
-        with open(sdk_path, "r", encoding="utf-8") as f:
-            return PlainTextResponse(f.read(), headers={"Cache-Control": "public, max-age=31536000"})
-    return PlainTextResponse("# SDK not found\n", status_code=404)
+async def handle_sdk(request: Request):
+    for p in (
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "tgcloud.py"),
+        os.path.join(os.path.dirname(__file__), "tgcloud.py"),
+        "tgcloud.py"
+    ):
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return PlainTextResponse(f.read(), headers={"Cache-Control": "public, max-age=31536000"})
+    return PlainTextResponse("# Upload tgcloud.py to repository root\n", status_code=404)
 
-# =========================================================
-# 2. ULTRA-COMPACT FALLBACK METADATA & KV ENDPOINTS
-# =========================================================
-async def health(request: Request):
-    return compact_json({"ok": 1, "v": "9.5-max", "load": 0}, cache_sec=3600)
-
-async def list_files(request: Request):
+async def handle_files(request: Request):
     if not check_auth(request):
-        return compact_json({"ok": 0}, 401)
-    tg = await get_tg()
-    limit = min(int(request.query_params.get("limit", 25)), 100)
-    q = request.query_params.get("q") or request.query_params.get("search") or None
-    items = [format_meta(m) async for m in tg.iter_messages("me", limit=limit, search=q)]
-    return compact_json({"ok": 1, "items": items})
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        limit = min(_safe_int(request.query_params.get("limit", 25)) or 25, 100)
+        q = request.query_params.get("q") or request.query_params.get("search") or None
+        items = [format_meta(m) async for m in tg.iter_messages("me", limit=limit, search=q)]
+        return compact_json({"ok": 1, "count": len(items), "items": items})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
 
-async def kv_handler(request: Request):
+async def handle_kv(request: Request, k: str):
     if not check_auth(request):
-        return compact_json({"ok": 0}, 401)
-    tg = await get_tg()
-    k = request.path_params.get("k")
-    tag = f"#KV_{k}"
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        if not k:
+            keys = {}
+            async for m in tg.iter_messages("me", limit=50, search="#KV_"):
+                if m.raw_text and m.raw_text.startswith("#KV_"):
+                    parts = m.raw_text.split("\n", 1)
+                    key_name = parts[0].replace("#KV_", "").strip()
+                    val_raw = parts[1].strip() if len(parts) > 1 else ""
+                    if key_name not in keys:
+                        try:
+                            keys[key_name] = json.loads(val_raw)
+                        except Exception:
+                            keys[key_name] = val_raw
+            return compact_json({"ok": 1, "count": len(keys), "data": keys})
 
-    if request.method == "GET":
-        async for m in tg.iter_messages("me", limit=5, search=tag):
-            if m.raw_text and m.raw_text.startswith(tag):
-                raw = m.raw_text[len(tag):].strip()
-                try:
-                    val = json.loads(raw)
-                except Exception:
-                    val = raw
-                return compact_json({"ok": 1, "k": k, "v": val, "id": m.id})
-        return compact_json({"ok": 0, "err": "not_found"}, 404)
+        tag = f"#KV_{k}"
+        if request.method == "GET":
+            async for m in tg.iter_messages("me", limit=5, search=tag):
+                if m.raw_text and m.raw_text.startswith(tag):
+                    raw = m.raw_text[len(tag):].strip()
+                    try:
+                        val = json.loads(raw)
+                    except Exception:
+                        val = raw
+                    return compact_json({"ok": 1, "k": k, "v": val, "id": m.id})
+            return compact_json({"ok": 0, "err": "not_found"}, 404)
 
-    if request.method == "DELETE":
+        if request.method == "DELETE":
+            ids = [m.id async for m in tg.iter_messages("me", limit=5, search=tag) if m.raw_text and m.raw_text.startswith(tag)]
+            if ids:
+                await tg.delete_messages("me", ids)
+            return compact_json({"ok": 1, "del": k})
+
+        body = await request.json()
+        val_obj = body.get("v", body.get("value", body))
+        val_str = json.dumps(val_obj, separators=(",", ":"), ensure_ascii=False)
         ids = [m.id async for m in tg.iter_messages("me", limit=5, search=tag) if m.raw_text and m.raw_text.startswith(tag)]
         if ids:
             await tg.delete_messages("me", ids)
-        return compact_json({"ok": 1, "del": k})
+        msg = await tg.send_message("me", f"{tag}\n{val_str}")
+        return compact_json({"ok": 1, "k": k, "id": msg.id})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
 
-    body = await request.json()
-    val_str = json.dumps(body.get("v", body.get("value", body)), separators=(",", ":"), ensure_ascii=False)
-    ids = [m.id async for m in tg.iter_messages("me", limit=5, search=tag) if m.raw_text and m.raw_text.startswith(tag)]
-    if ids:
-        await tg.delete_messages("me", ids)
-    msg = await tg.send_message("me", f"{tag}\n{val_str}")
-    return compact_json({"ok": 1, "k": k, "id": msg.id})
-
-async def delete_msg(request: Request):
+async def handle_delete(request: Request, mid: int):
     if not check_auth(request):
-        return compact_json({"ok": 0}, 401)
-    tg = await get_tg()
-    mid = int(request.path_params["id"])
-    await tg.delete_messages("me", [mid])
-    return compact_json({"ok": 1, "del": mid})
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        await tg.delete_messages("me", [mid])
+        return compact_json({"ok": 1, "del": mid})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
 
 # =========================================================
-# 3. 100% CLIENT-SIDE DIRECT MTPROTO WEBSOCKET DASHBOARD
+# 100% CLIENT-SIDE DIRECT MTPROTO WEBSOCKET DASHBOARD UI
 # =========================================================
-async def dashboard(request: Request):
+async def handle_dashboard(request: Request):
     return HTMLResponse("""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TG-CLOUD MAX // ZERO-VERCEL-LOAD</title>
+<title>TG-CLOUD V10 MAX // ZERO-VERCEL-LOAD</title>
 <script src="https://cdn.jsdelivr.net/npm/telegram@2.22.2/browser/telegram.min.js"></script>
 <style>
-:root{--bg:#040406;--card:rgba(14,16,22,0.92);--bd:rgba(255,255,255,0.09);--ac:#fff;--gr:#00ff9d;--rd:#ff4d4d;--tx:#e2e8f0;--mt:#94a3b8}
+:root{--bg:#040406;--card:rgba(14,16,22,0.94);--bd:rgba(255,255,255,0.1);--ac:#fff;--gr:#00ff9d;--rd:#ff4d4d;--tx:#e2e8f0;--mt:#94a3b8}
 *{box-sizing:border-box;font-family:'JetBrains Mono',monospace}
 body{background:var(--bg);color:var(--tx);margin:0;padding:14px}
 .wrap{max-width:960px;margin:0 auto}
-.box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px;backdrop-filter:blur(14px)}
+.box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px}
 h2{margin:0 0 8px;color:var(--ac);font-size:.88rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px}
 input,button{width:100%;padding:9px 10px;margin-top:6px;background:rgba(0,0,0,0.65);border:1px solid var(--bd);color:var(--tx);border-radius:6px;font-size:.8rem}
 button{background:var(--ac);color:#000;font-weight:700;cursor:pointer;border:none;transition:.15s}
@@ -177,12 +222,21 @@ a{color:var(--ac);text-decoration:none;margin-left:8px;font-weight:700;cursor:po
 <div class="wrap">
   <div class="box">
     <h2>
-      <span>⚡ TG-CLOUD MAX // 100% DIRECT MTPROTO</span>
+      <span>⚡ TG-CLOUD V10 MAX // 100% DIRECT MTPROTO</span>
       <span id="st" style="color:var(--gr);font-size:.74rem">0 BYTES VERCEL LOAD</span>
     </h2>
     <div style="display:flex;gap:8px">
-      <input type="password" id="key" placeholder="Optional API Key (cached locally)">
+      <input type="password" id="key" placeholder="Optional API Key (if set)">
       <button onclick="reconnectMT()" style="width:160px">CONNECT TG</button>
+    </div>
+    <div id="manualCfg" style="display:none;margin-top:8px;border-top:1px solid var(--bd);padding-top:8px">
+      <div style="font-size:.74rem;color:#ffb800;margin-bottom:4px">⚠️ Vercel Env Vars not set yet? Paste below to connect directly from browser (saved in browser localStorage):</div>
+      <div style="display:flex;gap:6px">
+        <input type="number" id="m_id" placeholder="TG_API_ID">
+        <input type="text" id="m_hash" placeholder="TG_API_HASH">
+      </div>
+      <input type="text" id="m_sess" placeholder="TG_SESSION_STRING">
+      <button onclick="saveManualCfg()" style="background:var(--gr)">SAVE IN BROWSER & CONNECT DIRECTLY</button>
     </div>
   </div>
 
@@ -229,17 +283,30 @@ a{color:var(--ac);text-decoration:none;margin-left:8px;font-weight:700;cursor:po
 let tgClient = null;
 const getKey = () => document.getElementById('key').value.trim();
 
+function saveManualCfg() {
+  const id = Number(document.getElementById('m_id').value.trim());
+  const hash = document.getElementById('m_hash').value.trim();
+  const s = document.getElementById('m_sess').value.trim();
+  if (!id || !hash || !s) return alert('Fill all 3 fields');
+  localStorage.setItem('tg_cloud_tk', JSON.stringify({ok: 1, id, hash, s}));
+  document.getElementById('manualCfg').style.display = 'none';
+  tgClient = null;
+  loadDirect();
+}
+
 async function getClient() {
   if (tgClient && tgClient.connected) return tgClient;
   const st = document.getElementById('st');
   st.innerText = 'CONNECTING DIRECT MTPROTO...';
 
-  // Cache ticket in localStorage so Vercel is not even called on page reloads!
   let tk = JSON.parse(localStorage.getItem('tg_cloud_tk') || 'null');
   if (!tk || !tk.s) {
     const r = await fetch('/api/ticket?key=' + encodeURIComponent(getKey()));
     tk = await r.json();
-    if (!tk.ok) throw new Error('Invalid API Key or Env Vars missing');
+    if (!tk.ok) {
+      document.getElementById('manualCfg').style.display = 'block';
+      throw new Error(tk.err || 'Env Vars missing');
+    }
     localStorage.setItem('tg_cloud_tk', JSON.stringify(tk));
   }
 
@@ -387,14 +454,48 @@ loadDirect();
 </body>
 </html>""")
 
+# =========================================================
+# UNIVERSAL CATCH-ALL ROUTER (NEVER RETURNS 404 NOT FOUND)
+# =========================================================
+async def master_router(request: Request):
+    raw_path = (
+        request.query_params.get("__path")
+        or request.headers.get("x-matched-path")
+        or request.url.path
+        or "/"
+    ).strip()
+
+    # Clean Vercel internal prefixes if present
+    for prefix in ("/api/index.py", "/api/index"):
+        if raw_path.startswith(prefix):
+            raw_path = raw_path[len(prefix):]
+            break
+
+    path = "/" + raw_path.strip("/")
+
+    if path in ("/", "/api"):
+        return await handle_dashboard(request)
+    if path in ("/health", "/stats", "/api/health", "/api/stats"):
+        return await handle_health(request)
+    if path in ("/ticket", "/api/ticket"):
+        return await handle_ticket(request)
+    if path.endswith("/tgcloud.py") or path in ("/sdk", "/api/sdk"):
+        return await handle_sdk(request)
+    if path in ("/files", "/api/files"):
+        return await handle_files(request)
+    if path == "/kv" or path.startswith("/kv/") or path.startswith("/api/kv"):
+        k = path.split("/kv")[-1].strip("/")
+        return await handle_kv(request, k)
+    if path.startswith("/delete/") or path.startswith("/api/delete/"):
+        mid = _safe_int(path.split("/delete/")[-1].strip("/"))
+        return await handle_delete(request, mid)
+
+    # Default fallback -> serve Dashboard so no URL ever returns Not Found
+    return await handle_dashboard(request)
+
 routes = [
-    Route("/", dashboard, methods=["GET"]),
-    Route("/health", health, methods=["GET"]),
-    Route("/api/ticket", get_ticket, methods=["GET"]),
-    Route("/sdk/tgcloud.py", serve_sdk, methods=["GET"]),
-    Route("/files", list_files, methods=["GET"]),
-    Route("/kv/{k:str}", kv_handler, methods=["GET", "POST", "DELETE"]),
-    Route("/delete/{id:int}", delete_msg, methods=["DELETE"]),
+    Route("/", master_router, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
+    Route("/{any_path:path}", master_router, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
 ]
 
 app = Starlette(
