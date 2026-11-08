@@ -1,15 +1,24 @@
 import os
+import io
+import gc
 import json
+import time
+import random
 import asyncio
 from typing import Optional, Dict, Any
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from starlette.responses import JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from starlette.routing import Route
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
+from telethon.tl.functions.upload import SaveBigFilePartRequest
+from telethon.tl.types import InputFileBig, DocumentAttributeFilename
+
+PART_SIZE = 512 * 1024  # 512 KB MTProto Part Size
 
 def _safe_int(val: Any) -> int:
     try:
@@ -27,23 +36,23 @@ CFG = {
 _client: Optional[TelegramClient] = None
 _loop = None
 
-async def get_tg(custom_cfg: Optional[Dict[str, Any]] = None) -> TelegramClient:
-    """Stateless, multi-bot safe MTProto connection (receive_updates=False prevents session lock)."""
+async def get_tg() -> TelegramClient:
+    """Stateless, multi-bot safe MTProto connection (receive_updates=False prevents session locks)."""
     global _client, _loop
-    c = custom_cfg or CFG
-    if not c.get("api_id") or not c.get("session_string"):
+    if not CFG["api_id"] or not CFG["session_string"]:
         raise RuntimeError("Missing TG_API_ID, TG_API_HASH, or TG_SESSION_STRING in Vercel Environment Variables")
 
     cur_loop = asyncio.get_running_loop()
     if _client is None or _loop != cur_loop:
         _loop = cur_loop
         _client = TelegramClient(
-            StringSession(c["session_string"]),
-            int(c["api_id"]),
-            c["api_hash"],
+            StringSession(CFG["session_string"]),
+            int(CFG["api_id"]),
+            CFG["api_hash"],
             receive_updates=False,
-            request_retries=5,
-            connection_retries=5,
+            request_retries=10,
+            connection_retries=10,
+            retry_delay=1,
             entity_cache_limit=5
         )
     if not _client.is_connected():
@@ -66,11 +75,14 @@ def compact_json(data: Any, status: int = 200, cache_sec: int = 0) -> JSONRespon
 def format_meta(msg) -> Dict[str, Any]:
     f = None
     if msg.file:
+        fname = msg.file.name or f"file_{msg.id}{msg.file.ext or ''}"
         f = {
-            "n": msg.file.name or f"file_{msg.id}{msg.file.ext or ''}",
+            "n": fname,
             "b": msg.file.size or 0,
             "mb": round((msg.file.size or 0) / 1048576, 2),
-            "m": msg.file.mime_type
+            "m": msg.file.mime_type,
+            "dl": f"/dl/{msg.id}/{fname}",
+            "chunk": f"/chunk/{msg.id}?offset=0&length=65536"
         }
     return {
         "id": msg.id,
@@ -79,17 +91,16 @@ def format_meta(msg) -> Dict[str, Any]:
     }
 
 # =========================================================
-# HANDLERS (0 BYTES VERCEL STORAGE / 0 BYTES FILE BANDWIDTH)
+# 1. CORE METADATA, TICKET & SDK ENDPOINTS
 # =========================================================
 async def handle_health(request: Request):
     env_ready = bool(CFG["api_id"] and CFG["api_hash"] and CFG["session_string"])
     return compact_json({
         "ok": 1,
-        "engine": "TG-Cloud V10 Final (Zero-Vercel-Load)",
+        "engine": "TG-Cloud V10.1 Final (Zero-Error Native Engine)",
         "env_configured": env_ready,
         "vercel_storage_used": "0 Bytes",
-        "vercel_file_bandwidth": "0 Bytes (Direct Client <-> Telegram MTProto)",
-        "routes": ["/", "/health", "/api/ticket", "/files", "/kv/{key}", "/delete/{id}", "/sdk/tgcloud.py"]
+        "multi_bot_safe": True
     })
 
 async def handle_ticket(request: Request):
@@ -98,7 +109,7 @@ async def handle_ticket(request: Request):
     if not CFG["api_id"] or not CFG["session_string"]:
         return compact_json({
             "ok": 0,
-            "err": "Set TG_API_ID, TG_API_HASH, and TG_SESSION_STRING in Vercel Project Settings -> Environment Variables, then Redeploy."
+            "err": "Set TG_API_ID, TG_API_HASH, and TG_SESSION_STRING in Vercel Environment Variables, then Redeploy."
         }, 400)
     return compact_json({
         "ok": 1,
@@ -189,7 +200,137 @@ async def handle_delete(request: Request, mid: int):
         return compact_json({"ok": 0, "err": str(e)}, 500)
 
 # =========================================================
-# 100% CLIENT-SIDE DIRECT MTPROTO WEBSOCKET DASHBOARD UI
+# 2. STATELESS PARALLEL MTPROTO CHUNK UPLOADER & STREAMER
+# =========================================================
+async def handle_single_upload(request: Request, fname: str):
+    """For small files (<3.5MB) or raw JSON/text."""
+    if not check_auth(request):
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        tag = request.query_params.get("tag", "#storage")
+        raw_bytes = await request.body()
+        bio = io.BytesIO(raw_bytes)
+        bio.name = fname
+        msg = await tg.send_file(
+            "me",
+            file=bio,
+            caption=f"{tag} {fname}".strip(),
+            force_document=True,
+            attributes=[DocumentAttributeFilename(file_name=fname)]
+        )
+        bio.close()
+        del raw_bytes
+        gc.collect()
+        return compact_json({"ok": 1, "item": format_meta(msg)})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
+
+async def handle_up_part(request: Request):
+    """
+    Receives a 2MB slice (up to 4 x 512KB MTProto parts) from the Browser UI and pushes
+    all 512KB parts concurrently to Telegram via SaveBigFilePartRequest with 0 disk usage!
+    """
+    if not check_auth(request):
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        file_id = int(request.query_params["file_id"])
+        base_part = int(request.query_params["base_part"])
+        total_parts = int(request.query_params["total_parts"])
+        raw_slice = await request.body()
+
+        tasks = []
+        sub_idx = 0
+        for offset in range(0, len(raw_slice), PART_SIZE):
+            part_bytes = raw_slice[offset:offset + PART_SIZE]
+            p_num = base_part + sub_idx
+            tasks.append(
+                tg(SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=p_num,
+                    file_total_parts=total_parts,
+                    bytes=part_bytes
+                ))
+            )
+            sub_idx += 1
+
+        await asyncio.gather(*tasks)
+        del raw_slice
+        gc.collect()
+        return compact_json({"ok": 1, "parts_saved": sub_idx})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
+
+async def handle_up_commit(request: Request):
+    """Finalizes a multi-part MTProto upload in Saved Messages."""
+    if not check_auth(request):
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        body = await request.json()
+        file_id = int(body["file_id"])
+        total_parts = int(body["total_parts"])
+        fname = str(body.get("filename", "file.bin"))
+        tag = str(body.get("tag", "#storage"))
+
+        input_file = InputFileBig(id=file_id, parts=total_parts, name=fname)
+        msg = await tg.send_file(
+            "me",
+            file=input_file,
+            caption=f"{tag} {fname}".strip(),
+            force_document=True,
+            attributes=[DocumentAttributeFilename(file_name=fname)]
+        )
+        return compact_json({"ok": 1, "item": format_meta(msg)})
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
+
+async def handle_chunk_or_dl(request: Request, mid: int):
+    """4KB-aligned selective chunk reader (/chunk/{id} & /dl/{id})."""
+    if not check_auth(request):
+        return compact_json({"ok": 0, "err": "Unauthorized"}, 401)
+    try:
+        tg = await get_tg()
+        msg = await tg.get_messages("me", ids=mid)
+        if not msg or not msg.file:
+            return compact_json({"ok": 0, "err": "File not found"}, 404)
+
+        total_size = msg.file.size or 0
+        fname = msg.file.name or f"file_{mid}.bin"
+        offset = _safe_int(request.query_params.get("offset", 0))
+        length = _safe_int(request.query_params.get("length", min(total_size - offset, 2097152)))
+        length = min(length, total_size - offset, 3145728)
+
+        aligned_offset = (offset // 4096) * 4096
+        skip = offset - aligned_offset
+        needed = length + skip
+
+        buf = bytearray()
+        async for chunk in tg.iter_download(msg.media, offset=aligned_offset, request_size=PART_SIZE):
+            buf.extend(chunk)
+            if len(buf) >= needed:
+                break
+
+        data = bytes(buf[skip:skip + length])
+        buf.clear()
+        gc.collect()
+
+        if request.query_params.get("as") == "text":
+            return PlainTextResponse(data.decode("utf-8", errors="replace"))
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Length": str(len(data)),
+            "Content-Range": f"bytes {offset}-{offset + len(data) - 1}/{total_size}",
+            "X-Total-Size": str(total_size)
+        }
+        return StreamingResponse(io.BytesIO(data), media_type=msg.file.mime_type or "application/octet-stream", headers=headers)
+    except Exception as e:
+        return compact_json({"ok": 0, "err": str(e)}, 500)
+
+# =========================================================
+# 3. ZERO-DEPENDENCY NATIVE DASHBOARD UI (NO BROKEN CDN!)
 # =========================================================
 async def handle_dashboard(request: Request):
     return HTMLResponse("""<!DOCTYPE html>
@@ -197,8 +338,7 @@ async def handle_dashboard(request: Request):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TG-CLOUD V10 MAX // ZERO-VERCEL-LOAD</title>
-<script src="https://cdn.jsdelivr.net/npm/telegram@2.22.2/browser/telegram.min.js"></script>
+<title>TG-CLOUD V10.1 MAX // ZERO-ERROR</title>
 <style>
 :root{--bg:#040406;--card:rgba(14,16,22,0.94);--bd:rgba(255,255,255,0.1);--ac:#fff;--gr:#00ff9d;--rd:#ff4d4d;--tx:#e2e8f0;--mt:#94a3b8}
 *{box-sizing:border-box;font-family:'JetBrains Mono',monospace}
@@ -222,240 +362,246 @@ a{color:var(--ac);text-decoration:none;margin-left:8px;font-weight:700;cursor:po
 <div class="wrap">
   <div class="box">
     <h2>
-      <span>⚡ TG-CLOUD V10 MAX // 100% DIRECT MTPROTO</span>
-      <span id="st" style="color:var(--gr);font-size:.74rem">0 BYTES VERCEL LOAD</span>
+      <span>⚡ TG-CLOUD V10.1 MAX // NATIVE PARALLEL ENGINE</span>
+      <span id="st" style="color:var(--gr);font-size:.74rem">ONLINE (0 DISK)</span>
     </h2>
-    <div style="display:flex;gap:8px">
-      <input type="password" id="key" placeholder="Optional API Key (if set)">
-      <button onclick="reconnectMT()" style="width:160px">CONNECT TG</button>
-    </div>
-    <div id="manualCfg" style="display:none;margin-top:8px;border-top:1px solid var(--bd);padding-top:8px">
-      <div style="font-size:.74rem;color:#ffb800;margin-bottom:4px">⚠️ Vercel Env Vars not set yet? Paste below to connect directly from browser (saved in browser localStorage):</div>
-      <div style="display:flex;gap:6px">
-        <input type="number" id="m_id" placeholder="TG_API_ID">
-        <input type="text" id="m_hash" placeholder="TG_API_HASH">
-      </div>
-      <input type="text" id="m_sess" placeholder="TG_SESSION_STRING">
-      <button onclick="saveManualCfg()" style="background:var(--gr)">SAVE IN BROWSER & CONNECT DIRECTLY</button>
-    </div>
+    <input type="password" id="key" placeholder="Optional API Key (leave empty if none)">
   </div>
 
   <div class="grid">
     <div class="box">
-      <h2>📤 4X PARALLEL DIRECT UPLOAD (UNLIMITED GB)</h2>
+      <h2>📤 PARALLEL CHUNK UPLOAD (UNLIMITED SIZE)</h2>
       <input type="file" id="files" multiple>
       <input type="text" id="utag" value="#storage" placeholder="Tag (#storage, #backup, #bot)">
-      <button onclick="uploadDirect()">UPLOAD DIRECTLY TO TELEGRAM</button>
+      <button onclick="uploadFiles()" id="upBtn">UPLOAD LOSSLESS TO TELEGRAM</button>
       <div id="ulog" class="log"></div>
     </div>
 
     <div class="box">
-      <h2>🗄️ DIRECT CLOUD KV DATABASE (0 SQLITE)</h2>
+      <h2>🗄️ CLOUD KV DATABASE (0 SQLITE)</h2>
       <div style="display:flex;gap:6px">
         <input type="text" id="kvk" placeholder="Key (e.g. config)">
         <input type="text" id="kvv" placeholder='Value / JSON (e.g. {"pro":true})'>
       </div>
       <div style="display:flex;gap:6px">
-        <button onclick="kvSet()">SAVE DIRECT</button>
-        <button onclick="kvGet()" style="background:var(--mt)">READ DIRECT</button>
+        <button onclick="kvSet()">SAVE KEY</button>
+        <button onclick="kvGet()" style="background:var(--mt)">READ KEY</button>
       </div>
       <div id="klog" class="log"></div>
     </div>
   </div>
 
   <div class="box">
-    <h2>🗂️ SAVED MESSAGES EXPLORER (100% DIRECT WEBSOCKET)</h2>
+    <h2>🗂️ SAVED MESSAGES EXPLORER</h2>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
       <span class="pill" onclick="setFilter('')">All</span>
       <span class="pill" onclick="setFilter('#storage')">📦 #storage</span>
+      <span class="pill" onclick="setFilter('#AI_MODEL')">🧠 #AI_MODEL</span>
       <span class="pill" onclick="setFilter('#remote')">🌐 #remote</span>
       <span class="pill" onclick="setFilter('#KV_')">🗄️ #KV_</span>
     </div>
     <div style="display:flex;gap:8px">
-      <input type="text" id="q" placeholder="Search filename or #tag directly on Telegram..." onkeyup="if(event.key==='Enter')loadDirect()">
-      <button onclick="loadDirect()" style="width:140px">REFRESH</button>
+      <input type="text" id="q" placeholder="Search filename or #tag..." onkeyup="if(event.key==='Enter')loadFiles()">
+      <button onclick="loadFiles()" style="width:140px">REFRESH</button>
     </div>
     <div id="list" style="margin-top:10px"></div>
   </div>
 </div>
 
 <script>
-let tgClient = null;
 const getKey = () => document.getElementById('key').value.trim();
 
-function saveManualCfg() {
-  const id = Number(document.getElementById('m_id').value.trim());
-  const hash = document.getElementById('m_hash').value.trim();
-  const s = document.getElementById('m_sess').value.trim();
-  if (!id || !hash || !s) return alert('Fill all 3 fields');
-  localStorage.setItem('tg_cloud_tk', JSON.stringify({ok: 1, id, hash, s}));
-  document.getElementById('manualCfg').style.display = 'none';
-  tgClient = null;
-  loadDirect();
-}
-
-async function getClient() {
-  if (tgClient && tgClient.connected) return tgClient;
-  const st = document.getElementById('st');
-  st.innerText = 'CONNECTING DIRECT MTPROTO...';
-
-  let tk = JSON.parse(localStorage.getItem('tg_cloud_tk') || 'null');
-  if (!tk || !tk.s) {
-    const r = await fetch('/api/ticket?key=' + encodeURIComponent(getKey()));
-    tk = await r.json();
-    if (!tk.ok) {
-      document.getElementById('manualCfg').style.display = 'block';
-      throw new Error(tk.err || 'Env Vars missing');
-    }
-    localStorage.setItem('tg_cloud_tk', JSON.stringify(tk));
-  }
-
-  const { TelegramClient } = window.telegram;
-  const { StringSession } = window.telegram.sessions;
-  tgClient = new TelegramClient(new StringSession(tk.s), Number(tk.id), tk.hash, {
-    connectionRetries: 15,
-    useWSS: true
-  });
-  await tgClient.connect();
-  st.innerText = '🟢 DIRECT TELEGRAM DC CONNECTED (0 VERCEL DATA)';
-  return tgClient;
-}
-
-async function reconnectMT() {
-  localStorage.removeItem('tg_cloud_tk');
-  tgClient = null;
-  await loadDirect();
-}
-
-async function uploadDirect() {
+async function uploadFiles() {
   const fl = document.getElementById('files').files;
-  if (!fl.length) return alert('Select file(s)');
+  if (!fl.length) return alert('Select file(s) first!');
   const log = document.getElementById('ulog');
   const tag = document.getElementById('utag').value || '#storage';
-  try {
-    const c = await getClient();
-    for (let i = 0; i < fl.length; i++) {
-      const f = fl[i];
-      const t0 = Date.now();
-      await c.sendFile('me', {
-        file: f,
-        caption: `${tag} ${f.name}`,
-        forceDocument: true,
-        workers: 4,
-        progressCallback: (p) => {
-          const mb = (f.size / 1048576).toFixed(2);
-          const sec = Math.max((Date.now() - t0) / 1000, 0.1);
-          const spd = (((f.size * p) / 1048576) / sec).toFixed(2);
-          log.innerText = `⚡ [${i+1}/${fl.length}] ${f.name} (${mb}MB): ${(p*100).toFixed(1)}% — ${spd} MB/s (0 Vercel Load)`;
-        }
+
+  for (let idx = 0; idx < fl.length; idx++) {
+    const f = fl[idx];
+    const t0 = Date.now();
+
+    // Small file (<3MB) -> Single fast request
+    if (f.size <= 3 * 1024 * 1024) {
+      log.innerText = `⚡ Uploading ${f.name} (${(f.size/1048576).toFixed(2)} MB)...`;
+      const r = await fetch(`/up/${encodeURIComponent(f.name)}?tag=${encodeURIComponent(tag)}&key=${encodeURIComponent(getKey())}`, {
+        method: 'PUT',
+        body: f
       });
+      const d = await r.json();
+      if (!d.ok) { log.innerText = '❌ ' + d.err; return; }
+      continue;
     }
-    log.innerText = '✅ 100% Lossless Upload Complete!';
-    document.getElementById('files').value = '';
-    await loadDirect();
-  } catch (e) {
-    log.innerText = '❌ ' + e.message;
+
+    // Large file (>3MB to 2GB) -> Slice into 2MB (4 x 512KB) chunks & upload in parallel!
+    const PART_BYTES = 512 * 1024;
+    const SLICE_BYTES = 4 * PART_BYTES; // 2 MB per HTTP call
+    const totalParts = Math.ceil(f.size / PART_BYTES);
+    const totalSlices = Math.ceil(f.size / SLICE_BYTES);
+    const fileId = Math.floor(Math.random() * 9000000000000000) + 1000000000000;
+
+    let completedSlices = 0;
+    let nextSlice = 0;
+    const workers = 3;
+
+    async function sliceWorker() {
+      while (nextSlice < totalSlices) {
+        const sIdx = nextSlice++;
+        const startByte = sIdx * SLICE_BYTES;
+        const endByte = Math.min(startByte + SLICE_BYTES, f.size);
+        const blob = f.slice(startByte, endByte);
+        const basePart = sIdx * 4;
+
+        for (let retry = 0; retry < 10; retry++) {
+          try {
+            const r = await fetch(`/api/up-part?file_id=${fileId}&base_part=${basePart}&total_parts=${totalParts}&key=${encodeURIComponent(getKey())}`, {
+              method: 'POST',
+              body: blob
+            });
+            const d = await r.json();
+            if (d.ok) break;
+          } catch (e) {}
+          await new Promise(res => setTimeout(res, 1500));
+        }
+        completedSlices++;
+        const pct = ((completedSlices / totalSlices) * 100).toFixed(1);
+        const sec = Math.max((Date.now() - t0) / 1000, 0.1);
+        const spd = (((completedSlices * SLICE_BYTES) / 1048576) / sec).toFixed(2);
+        log.innerText = `⚡ Uploading ${f.name}: ${pct}% (${spd} MB/s)...`;
+      }
+    }
+
+    await Promise.all(Array.from({length: Math.min(workers, totalSlices)}, () => sliceWorker()));
+
+    log.innerText = `⏳ Finalizing ${f.name} in Saved Messages...`;
+    const cr = await fetch(`/api/up-commit?key=${encodeURIComponent(getKey())}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ file_id: fileId, total_parts: totalParts, filename: f.name, tag })
+    });
+    const cd = await cr.json();
+    if (!cd.ok) { log.innerText = '❌ ' + cd.err; return; }
   }
+
+  log.innerText = '✅ 100% Lossless Upload Complete!';
+  document.getElementById('files').value = '';
+  loadFiles();
 }
 
-async function downloadDirect(msgId, name) {
+async function fastDownload(id, name, totalBytes) {
   const log = document.getElementById('ulog');
-  try {
-    const c = await getClient();
-    const msgs = await c.getMessages('me', { ids: [Number(msgId)] });
-    if (!msgs || !msgs[0]) return alert('File not found');
-    const t0 = Date.now();
-    const buf = await c.downloadMedia(msgs[0], {
-      workers: 4,
-      progressCallback: (dl, tot) => {
-        const pct = tot ? ((Number(dl) / Number(tot)) * 100).toFixed(1) : '...';
-        const spd = ((Number(dl) / 1048576) / Math.max((Date.now() - t0)/1000, 0.1)).toFixed(2);
-        log.innerText = `⚡ Downloading ${name}: ${pct}% — ${spd} MB/s (0 Vercel Load)`;
-      }
-    });
-    const url = URL.createObjectURL(new Blob([buf]));
-    const a = document.createElement('a');
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
-    log.innerText = `✅ Downloaded ${name}!`;
-  } catch (e) {
-    log.innerText = '❌ ' + e.message;
+  if (totalBytes <= 3 * 1024 * 1024) {
+    window.open(`/dl/${id}/${encodeURIComponent(name)}?key=${encodeURIComponent(getKey())}`, '_blank');
+    return;
   }
+
+  // Parallel 2MB Chunked Downloader for large files
+  const CHUNK = 2 * 1024 * 1024;
+  const count = Math.ceil(totalBytes / CHUNK);
+  const buffers = new Array(count);
+  let done = 0, next = 0;
+  const t0 = Date.now();
+
+  async function dlWorker() {
+    while (next < count) {
+      const i = next++;
+      const off = i * CHUNK;
+      const len = Math.min(CHUNK, totalBytes - off);
+      for (let retry = 0; retry < 10; retry++) {
+        try {
+          const r = await fetch(`/chunk/${id}?offset=${off}&length=${len}&key=${encodeURIComponent(getKey())}`);
+          if (r.ok) {
+            buffers[i] = await r.arrayBuffer();
+            break;
+          }
+        } catch (e) {}
+        await new Promise(res => setTimeout(res, 1500));
+      }
+      done++;
+      const pct = ((done / count) * 100).toFixed(1);
+      const spd = (((done * CHUNK) / 1048576) / Math.max((Date.now() - t0)/1000, 0.1)).toFixed(2);
+      log.innerText = `⚡ Downloading ${name}: ${pct}% (${spd} MB/s)...`;
+    }
+  }
+
+  await Promise.all(Array.from({length: Math.min(4, count)}, () => dlWorker()));
+  const blob = new Blob(buffers);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+  log.innerText = `✅ Downloaded ${name}!`;
 }
 
 async function kvSet() {
   const k = document.getElementById('kvk').value.trim();
   const v = document.getElementById('kvv').value.trim();
   if (!k) return;
-  const c = await getClient();
-  const tag = `#KV_${k}`;
-  const old = await c.getMessages('me', { search: tag, limit: 5 });
-  const delIds = old.filter(m => m.message && m.message.startsWith(tag)).map(m => m.id);
-  if (delIds.length) await c.deleteMessages('me', delIds, { revoke: true });
-  const msg = await c.sendMessage('me', { message: `${tag}\n${v}` });
-  document.getElementById('klog').innerText = `✅ Saved ${k} (Msg #${msg.id} | 0 Vercel Calls)`;
-  await loadDirect();
+  let parsed = v;
+  try { parsed = JSON.parse(v); } catch(e) {}
+  const r = await fetch(`/kv/${encodeURIComponent(k)}?key=${encodeURIComponent(getKey())}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({v: parsed})
+  });
+  const d = await r.json();
+  document.getElementById('klog').innerText = JSON.stringify(d);
+  loadFiles();
 }
 
 async function kvGet() {
   const k = document.getElementById('kvk').value.trim();
   if (!k) return;
-  const c = await getClient();
-  const tag = `#KV_${k}`;
-  const msgs = await c.getMessages('me', { search: tag, limit: 5 });
-  const found = msgs.find(m => m.message && m.message.startsWith(tag));
-  document.getElementById('klog').innerText = found ? found.message.slice(tag.length).trim() : 'Not found';
+  const r = await fetch(`/kv/${encodeURIComponent(k)}?key=${encodeURIComponent(getKey())}`);
+  document.getElementById('klog').innerText = JSON.stringify(await r.json());
 }
 
-async function delDirect(id) {
-  const c = await getClient();
-  await c.deleteMessages('me', [Number(id)], { revoke: true });
-  await loadDirect();
+async function delItem(id) {
+  await fetch(`/delete/${id}?key=${encodeURIComponent(getKey())}`, { method: 'DELETE' });
+  loadFiles();
 }
 
 function setFilter(q) {
   document.getElementById('q').value = q;
-  loadDirect();
+  loadFiles();
 }
 
-async function loadDirect() {
+async function loadFiles() {
   const list = document.getElementById('list');
   const q = document.getElementById('q').value.trim();
   try {
-    const c = await getClient();
-    const msgs = await c.getMessages('me', { limit: 25, search: q || undefined });
-    list.innerHTML = msgs.map(m => {
-      let fname = null, mb = 0;
-      if (m.media && m.media.document) {
-        const doc = m.media.document;
-        mb = (Number(doc.size || 0) / 1048576).toFixed(2);
-        const attr = (doc.attributes || []).find(a => a.fileName);
-        fname = attr ? attr.fileName : `file_${m.id}.bin`;
-      }
-      const label = fname || (m.message || '').slice(0, 80) || '[Media]';
-      const safeName = (fname || 'file.bin').replace(/'/g, "\\'");
+    const r = await fetch(`/files?limit=30&q=${encodeURIComponent(q)}&key=${encodeURIComponent(getKey())}`);
+    const d = await r.json();
+    if (!d.ok) {
+      list.innerHTML = `<div class="log" style="color:var(--rd)">❌ ${d.err || 'Error loading files'}</div>`;
+      return;
+    }
+    list.innerHTML = (d.items || []).map(i => {
+      const f = i.f;
+      const safeName = f ? f.n.replace(/'/g, "\\'") : 'file.bin';
       return `<div class="row">
         <div style="word-break:break-all">
-          <strong>#${m.id}</strong> ${label}
-          <span class="tag">${fname ? '(' + mb + ' MB)' : '[MSG]'}</span>
+          <strong>#${i.id}</strong> ${f ? f.n : i.t}
+          <span class="tag">${f ? '(' + f.mb + ' MB)' : '[MSG]'}</span>
         </div>
         <div style="white-space:nowrap">
-          ${fname ? `<a onclick="downloadDirect(${m.id},'${safeName}')" style="color:var(--gr)">[⚡DIRECT DL]</a>` : ''}
-          <a onclick="delDirect(${m.id})" style="color:var(--rd)">[X]</a>
+          ${f ? `<a onclick="fastDownload(${i.id},'${safeName}',${f.b})" style="color:var(--gr)">[⚡FAST DL]</a>` : ''}
+          ${f ? `<a href="/chunk/${i.id}?offset=0&length=4096&as=text&key=${encodeURIComponent(getKey())}" target="_blank" style="color:var(--mt)">[PEEK]</a>` : ''}
+          <a onclick="delItem(${i.id})" style="color:var(--rd)">[X]</a>
         </div>
       </div>`;
-    }).join('');
+    }).join('') || '<div class="log">No items found.</div>';
   } catch (e) {
-    list.innerHTML = `<div class="log">❌ ${e.message}</div>`;
+    list.innerHTML = `<div class="log" style="color:var(--rd)">❌ ${e.message}</div>`;
   }
 }
-loadDirect();
+loadFiles();
 </script>
 </body>
 </html>""")
 
 # =========================================================
-# UNIVERSAL CATCH-ALL ROUTER (NEVER RETURNS 404 NOT FOUND)
+# 4. UNIVERSAL CATCH-ALL ROUTER
 # =========================================================
 async def master_router(request: Request):
     raw_path = (
@@ -465,7 +611,6 @@ async def master_router(request: Request):
         or "/"
     ).strip()
 
-    # Clean Vercel internal prefixes if present
     for prefix in ("/api/index.py", "/api/index"):
         if raw_path.startswith(prefix):
             raw_path = raw_path[len(prefix):]
@@ -483,6 +628,17 @@ async def master_router(request: Request):
         return await handle_sdk(request)
     if path in ("/files", "/api/files"):
         return await handle_files(request)
+    if path == "/api/up-part":
+        return await handle_up_part(request)
+    if path == "/api/up-commit":
+        return await handle_up_commit(request)
+    if path.startswith("/up/"):
+        fname = path.split("/up/", 1)[1].strip("/") or "file.bin"
+        return await handle_single_upload(request, fname)
+    if path.startswith("/chunk/") or path.startswith("/dl/"):
+        parts = [p for p in path.split("/") if p]
+        mid = _safe_int(parts[1]) if len(parts) > 1 else 0
+        return await handle_chunk_or_dl(request, mid)
     if path == "/kv" or path.startswith("/kv/") or path.startswith("/api/kv"):
         k = path.split("/kv")[-1].strip("/")
         return await handle_kv(request, k)
@@ -490,7 +646,6 @@ async def master_router(request: Request):
         mid = _safe_int(path.split("/delete/")[-1].strip("/"))
         return await handle_delete(request, mid)
 
-    # Default fallback -> serve Dashboard so no URL ever returns Not Found
     return await handle_dashboard(request)
 
 routes = [
@@ -501,4 +656,5 @@ routes = [
 app = Starlette(
     routes=routes,
     middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])]
-)
+    )
+        
