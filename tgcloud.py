@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TG-Cloud V9.5 MAX // Universal Zero-Vercel-Load Direct MTProto SDK & CLI
+TG-Cloud V10 MAX // Universal Zero-Vercel-Load Direct MTProto SDK & CLI
 - 100% Direct Bot/Device <-> Telegram Data Center (0 Bytes Vercel Bandwidth/Storage).
 - 4x Parallel Async Workers (512KB MTProto Chunks) + 15x Anti-Breakable Auto-Retry.
 - Multi-Bot Safe: Uses receive_updates=False so 100+ bots can run simultaneously.
@@ -25,7 +25,7 @@ from telethon.tl.types import InputFileBig, InputFile, DocumentAttributeFilename
 PART_SIZE = 512 * 1024  # 512 KB Max MTProto Chunk
 PARALLEL_WORKERS = 4    # 4x Concurrent Workers (Strict 2 MB RAM Buffer Cap)
 
-VERCEL_URL = os.environ.get("TG_VERCEL_URL", "http://127.0.0.1:8000").rstrip("/")
+VERCEL_URL = os.environ.get("TG_VERCEL_URL", "https://tgclodd.vercel.app").rstrip("/")
 API_KEY = os.environ.get("TG_API_KEY", "")
 LOCAL_CFG = os.path.expanduser("~/.tg_cloud_ticket.json")
 TERMUX_CFG = os.path.expanduser("~/tg_cloud_config.json")
@@ -52,7 +52,6 @@ def _get_creds() -> Dict[str, Any]:
     if _cached_creds:
         return _cached_creds
 
-    # 1. Check Environment Variables first (0 network calls)
     if os.environ.get("TG_API_ID") and os.environ.get("TG_SESSION_STRING"):
         _cached_creds = {
             "id": int(os.environ["TG_API_ID"]),
@@ -61,7 +60,6 @@ def _get_creds() -> Dict[str, Any]:
         }
         return _cached_creds
 
-    # 2. Check Local Cached Ticket / Termux Config (0 Vercel calls)
     for path in (TERMUX_CFG, LOCAL_CFG):
         if os.path.exists(path):
             try:
@@ -76,11 +74,12 @@ def _get_creds() -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # 3. Fetch 180-byte ticket ONCE from Vercel and cache locally forever
     headers = {"x-api-key": API_KEY} if API_KEY else {}
     r = httpx.get(f"{VERCEL_URL}/api/ticket", headers=headers, timeout=15.0)
     r.raise_for_status()
     tk = r.json()
+    if not tk.get("ok"):
+        raise RuntimeError(tk.get("err", "Failed to fetch ticket"))
     _cached_creds = {"id": int(tk["id"]), "hash": tk["hash"], "s": tk["s"]}
     try:
         with open(LOCAL_CFG, "w", encoding="utf-8") as f:
@@ -95,7 +94,7 @@ def _make_client() -> TelegramClient:
         StringSession(c["s"]),
         int(c["id"]),
         c["hash"],
-        receive_updates=False,  # Prevents session conflicts across unlimited concurrent bots
+        receive_updates=False,
         request_retries=15,
         connection_retries=15,
         retry_delay=1,
@@ -103,9 +102,6 @@ def _make_client() -> TelegramClient:
         entity_cache_limit=10
     )
 
-# =========================================================
-# 1. 4X PARALLEL ANTI-BREAKABLE UPLOAD (0 VERCEL LOAD)
-# =========================================================
 async def _upload_async(source: Union[str, bytes, bytearray, io.IOBase], filename: str, tag: str, caption: str) -> Dict[str, Any]:
     client = _make_client()
     await client.connect()
@@ -229,9 +225,6 @@ async def _upload_async(source: Union[str, bytes, bytearray, io.IOBase], filenam
         await client.disconnect()
         gc.collect()
 
-# =========================================================
-# 2. ANTI-BREAKABLE DIRECT URL -> TELEGRAM PIPE (0 DISK)
-# =========================================================
 async def _pipe_url_async(url: str, filename: Optional[str], tag: str, caption: str) -> Dict[str, Any]:
     client = _make_client()
     await client.connect()
@@ -338,9 +331,6 @@ async def _pipe_url_async(url: str, filename: Optional[str], tag: str, caption: 
         await client.disconnect()
         gc.collect()
 
-# =========================================================
-# 3. RESUMABLE DOWNLOAD, CHUNK READER & DIRECT KV DB
-# =========================================================
 async def _download_async(msg_id: int, output_path: Optional[str] = None, offset: int = 0, length: Optional[int] = None) -> Union[str, bytes]:
     client = _make_client()
     await client.connect()
@@ -459,9 +449,6 @@ def _run(coro):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(asyncio.run, coro).result()
 
-# =========================================================
-# 4. PUBLIC FUNCTIONS FOR ANY PYTHON BOT / TOOL / SCRIPT
-# =========================================================
 def upload(file_path_or_bytes: Union[str, bytes, bytearray, io.IOBase], filename: Optional[str] = None, tag: str = "#storage", caption: str = "") -> Dict[str, Any]:
     if not filename:
         filename = os.path.basename(file_path_or_bytes) if isinstance(file_path_or_bytes, str) else "buffer.bin"
